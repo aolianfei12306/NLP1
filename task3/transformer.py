@@ -174,3 +174,35 @@ class Transformer(nn.Module):
         enc_output, enc_attentions = self.encoder(src, src_mask)
         dec_output, self_attentions, cross_attentions = self.decoder(tgt, enc_output, src_mask, tgt_mask)
         return dec_output, enc_attentions, self_attentions, cross_attentions
+    
+
+
+class AdditionModel(nn.Module):
+    def __init__(self, vocab_size, pad_idx = 0, d_model=128, num_layers=2, num_heads=4, d_ff=256, max_len=50, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
+
+        self.positional_encoding = PositionalEncoding(d_model = d_model)
+        self.transformer = Transformer(num_layers, d_model, num_heads, d_ff, dropout)
+
+        self.fc_out = nn.Linear(d_model, vocab_size)
+
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+        src = self.embedding(src)
+        tgt = self.embedding(tgt)
+        # 先加位置编码
+        src = self.positional_encoding(src)
+        tgt = self.positional_encoding(tgt)
+        out, _, _, _ = self.transformer(src, tgt, src_mask, tgt_mask)
+        return self.fc_out(out)
+
+def create_src_mask(src, pad_idx, device):
+    return (src != pad_idx).unsqueeze(1).unsqueeze(2).to(device)
+
+def create_tgt_mask(tgt, pad_idx, device):
+    seq_len = tgt.size(1)
+    look_ahead_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    look_ahead_mask = (~look_ahead_mask).to(device)
+    padding_mask = (tgt != pad_idx).unsqueeze(1).unsqueeze(2).to(device)
+    tgt_mask = look_ahead_mask.unsqueeze(0).unsqueeze(0) & padding_mask.expand(-1, -1, seq_len, -1)
+    return tgt_mask
