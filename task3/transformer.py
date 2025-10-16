@@ -58,6 +58,8 @@ class MultiheadAttention(nn.Module):
         # 2. 计算注意力分数 (QK^T / sqrt(d_k))
         scores = torch.matmul(query, key.transpose(-2, -1)) / self.scale
         if mask is not None:
+            # print("mask shape:", mask.shape)
+            # print("scores shape:", scores.shape)
             scores = scores.masked_fill(mask == 0, -1e9)
         
         # 3. softmax 得到注意力权重
@@ -120,12 +122,15 @@ class TransformerDecoderLayer(nn.Module):
         x = self.norm1(x + self.dropout(attn_output))
         
         # Cross-attention
-        attn_output, cross_attn = self.cross_attn(x, enc_output, enc_output, src_mask)
-        x = self.norm2(x + self.dropout(attn_output))
+        cross_attn = None
+        if enc_output is not None:
+            attn_output, cross_attn = self.cross_attn(x, enc_output, enc_output, src_mask)
+            x = self.norm2(x + self.dropout(attn_output))
         
         # Feed-forward
         ff_output = self.feed_forward(x)
         x = self.norm3(x + self.dropout(ff_output))
+        
         return x, self_attn, cross_attn
 
 class TransformerEncoder(nn.Module):
@@ -154,13 +159,14 @@ class TransformerDecoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_model)
         
-    def forward(self, x, enc_output, src_mask=None, tgt_mask=None):
+    def forward(self, x, enc_output=None, src_mask=None, tgt_mask=None):
         self_attentions = []
-        cross_attentions = []
+        cross_attentions = [] if enc_output is not None else None
         for layer in self.layers:
             x, self_attn, cross_attn = layer(x, enc_output, src_mask, tgt_mask)
             self_attentions.append(self_attn)
-            cross_attentions.append(cross_attn)
+            if enc_output is not None:
+                cross_attentions.append(cross_attn)
         x = self.norm(x)
         return x, self_attentions, cross_attentions
 
@@ -176,11 +182,40 @@ class Transformer(nn.Module):
         return dec_output, enc_attentions, self_attentions, cross_attentions
     
 
+class Transformer_DecoderOnly(nn.Module):
+    def __init__(self, num_layers, d_model, num_heads, d_ff, dropout=0.1):
+        super(Transformer_DecoderOnly, self).__init__()
+        self.decoder = TransformerDecoder(num_layers, d_model, num_heads, d_ff, dropout)
+        
+    def forward(self, tgt, tgt_mask=None):
+        dec_output, self_attentions, cross_attentions = self.decoder(tgt, None, None, tgt_mask)
+        return dec_output, self_attentions
+
+class AdditionModel_DecoderOnly(nn.Module):
+    def __init__(self, vocab_size, pad_idx = 0, d_model=128, num_layers=2, num_heads=4, d_ff=256, max_len=50, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
+        self.maxlen = max_len
+
+        self.positional_encoding = PositionalEncoding(d_model = d_model)
+        self.transformer = Transformer_DecoderOnly(num_layers, d_model, num_heads, d_ff, dropout)
+
+        self.fc_out = nn.Linear(d_model, vocab_size)
+
+    def forward(self, tgt, tgt_mask=None, src=None, src_mask=None):
+        tgt = self.embedding(tgt)
+        # 先加位置编码
+        tgt = self.positional_encoding(tgt)
+        out, _ = self.transformer(tgt, tgt_mask)
+        return self.fc_out(out)
+
+
 
 class AdditionModel(nn.Module):
     def __init__(self, vocab_size, pad_idx = 0, d_model=128, num_layers=2, num_heads=4, d_ff=256, max_len=50, dropout=0.1):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
+        self.maxlen = max_len
 
         self.positional_encoding = PositionalEncoding(d_model = d_model)
         self.transformer = Transformer(num_layers, d_model, num_heads, d_ff, dropout)
@@ -206,3 +241,51 @@ def create_tgt_mask(tgt, pad_idx, device):
     padding_mask = (tgt != pad_idx).unsqueeze(1).unsqueeze(2).to(device)
     tgt_mask = look_ahead_mask.unsqueeze(0).unsqueeze(0) & padding_mask.expand(-1, -1, seq_len, -1)
     return tgt_mask
+
+def create_combined_mask(src, tgt, pad_idx, device):
+    """
+    为decoder-only模型创建组合mask
+    现在改为loss mask
+    src: [batch_size, src_len]
+    tgt: [batch_size, tgt_len]
+    """
+    batch_size = src.size(0)
+    src_len = src.size(1)
+    tgt_len = tgt.size(1)
+    total_len = src_len + tgt_len 
+    # print("total_len:", total_len)
+    
+    # 1. 创建基础的padding mask（针对整个序列）
+    # 假设src和tgt都已经padding过
+    src_padding_mask = (src != pad_idx)  # [batch_size, src_len]
+    tgt_padding_mask = (tgt != pad_idx)  # [batch_size, tgt_len]
+    
+    # 拼接padding mask
+    combined_padding_mask = torch.cat([src_padding_mask, tgt_padding_mask], dim=1)  # [batch_size, total_len]
+    
+    # 2. 创建sequence mask（允许encoder部分完全可见，decoder部分因果可见）
+    sequence_mask = torch.ones(batch_size, total_len, total_len, device=device)
+    
+    for i in range(batch_size):
+        # 规则1: encoder部分内部完全可见
+        sequence_mask[i, :src_len, :src_len] = 0
+        
+        # 规则2: decoder部分可以看到所有encoder部分
+        sequence_mask[i, src_len:, :src_len] = 0
+        
+        # 规则3: decoder部分内部使用因果mask
+        for j in range(src_len, total_len):
+            sequence_mask[i, j, src_len:j+1] = 0  # 只能看到之前的decoder位置
+    
+    # 3. 合并padding mask和sequence mask
+    # 扩展padding_mask到attention矩阵的形状
+    padding_mask_expanded = (~combined_padding_mask).unsqueeze(1)  # [batch_size, 1, total_len]
+    padding_mask_expanded = padding_mask_expanded.expand(batch_size, total_len, total_len)
+    
+    # 最终mask：padding位置或sequence mask位置都需要被mask
+    # 注意：我们的MultiheadAttention中使用mask==0的位置被填充-1e9
+    final_mask = (padding_mask_expanded | (sequence_mask == 1)).unsqueeze(1) #  [batch_size, total_len, total_len]
+    # final_mask.unsqueeze(1) # [batch_size, 1, total_len, total_len]
+    
+    return final_mask
+

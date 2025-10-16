@@ -3,9 +3,13 @@
 checkpoints/
 *.zip
 *.rar
+*.csv
+*.pth
+*.txt
+*.json
+*.npy
 
-
-
+**/__pycache__/*
 
 
 # Byte-compiled / optimized / DLL files

@@ -1,4 +1,5 @@
 import torch
+from tqdm import tqdm
 from dataset import *
 from transformer import *
 
@@ -19,60 +20,46 @@ def decode_tgt(labels, dataset):
         tokens.append(tok)
     return "".join(tokens)
 
-def greedy_decode(model, dataset, src_str, max_len=None, device=None):
-    """
-    Greedy decode for your Transformer-based AdditionModel.
-    - model: 已加载的 AdditionModel (已 to(device))
-    - dataset: AdditionDataset 实例（用于 vocab, id2token, _encode, _pad, max_len）
-    - src_str: 输入字符串，例如 "123+456="
-    - max_len: 最大生成长度（默认 dataset.max_len）
-    - device: torch.device（默认取 model 的参数所在 device）
-    返回：生成的字符串（不包含 <sos> 或 <eos>）
-    """
-    model.eval()
-    # 取 device
-    if device is None:
-        device = next(model.parameters()).device
-
+def generate(model, dataset, src_str, device='cuda', max_len=50):
+    arch = "decoder-only" if isinstance(model, AdditionModel_DecoderOnly) else "encoder-decoder"
     pad_idx = dataset.vocab["<pad>"]
     sos_idx = dataset.vocab["<sos>"]
     eos_idx = dataset.vocab["<eos>"]
+    generated = [sos_idx] + dataset._encode(src_str)
 
-    if max_len is None:
-        max_len = dataset.max_len
+    # === 准备输入 ===
+    if arch == "encoder-decoder":
+        src_ids = dataset._pad(dataset._encode(src_str))
+        src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)
+        src_mask = create_src_mask(src_tensor, pad_idx, device)
+        generated = [sos_idx]
+        decode_start = 1
+    else:  # decoder-only
+        src_tensor, src_mask = None, None
+        generated = dataset._encode(src_str)
+        decode_start = len(generated)
 
-    # --- prepare src (encode + pad) ---
-    src_ids = dataset._encode(src_str)          # eg [1,2,3,10,4,5,6,11]
-    src_ids = dataset._pad(src_ids)             # pad 到 dataset.max_len
-    src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)  # [1, src_len]
-
-    # src mask 与训练时一致
-    src_mask = create_src_mask(src_tensor, pad_idx, device)  # 参考你定义的 create_src_mask
-
-    # --- decode loop (greedy) ---
-    generated = [sos_idx]
-
+    # === 循环生成 ===
     with torch.no_grad():
         for _ in range(max_len):
-            tgt_tensor = torch.tensor([generated], dtype=torch.long, device=device)  # [1, cur_tgt_len]
-            tgt_mask = create_tgt_mask(tgt_tensor, pad_idx, device)  # 使用当前 tgt_tensor 生成 mask
+            tgt_tensor = torch.tensor([generated], dtype=torch.long, device=device)
+            tgt_mask = create_tgt_mask(tgt_tensor, pad_idx, device)
 
-            # forward：model 返回 [batch, seq_len, vocab_size]
-            logits = model(src_tensor, tgt_tensor, src_mask, tgt_mask)  # logits shape
-            # 如果 model 返回 tuple (fc_out out), 上面假定 model 返回 fc_out(out)
-            # 取最后一步的 logits
-            # logits: [1, cur_tgt_len, vocab_size]
-            next_logits = logits[0, -1, :]  # [vocab_size]
-            next_id = int(torch.argmax(next_logits, dim=-1).item())
+            # 统一 forward，区别只在参数
+            #if arch == "encoder-decoder":
+            logits = model(src=src_tensor,tgt=tgt_tensor,src_mask=src_mask,tgt_mask=tgt_mask)
+            # else:  # decoder-only
+            #     logits = model(tgt_tensor, tgt_mask)
 
+            next_id = int(torch.argmax(logits[0, -1, :]).item())
             generated.append(next_id)
 
             if next_id == eos_idx:
                 break
 
-    # 把生成 id 序列转换为字符串（跳过起始符 <sos>，遇到 <eos> 停）
+    # === 解码输出 ===
     tokens = []
-    for idx in generated[1:]:  # skip <sos>
+    for idx in generated[decode_start:]:
         tok = dataset.id2token[int(idx)]
         if tok == "<eos>":
             break
@@ -81,38 +68,83 @@ def greedy_decode(model, dataset, src_str, max_len=None, device=None):
     return "".join(tokens)
 
 
+
+
+from collections import defaultdict
+
+def sebset_loader(dataset, x):
+    if(len(dataset) >= x):
+        subset = Subset(dataset, indices=range(x))
+        loader = DataLoader(subset, batch_size=32, shuffle=False)
+    else:
+        loader = DataLoader(dataset, batch_size=32, shuffle=False)
+    
+    return loader
+
 def compute_accuracy(model, dataset, loader, device):
     """
-    计算给定 loader 的准确率
+    计算给定 loader 的准确率，同时输出各类别的统计结果。
+    arch: "encoder-decoder" 或 "decoder-only"
     """
+    arch = "decoder-only" if isinstance(model, AdditionModel_DecoderOnly) else "encoder-decoder"
     model.eval()
     correct = 0
     total = 0
+    stats = defaultdict(lambda: {"correct": 0, "total": 0})
+
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, desc="Evaluating"):
             src = batch["input_ids"].to(device)
             tgt = batch["labels"].to(device)
             batch_size = src.size(0)
             for i in range(batch_size):
-                # 解码 src 为字符串
-                src_ids = src[i]
+                # ground truth
+                true = decode_tgt(tgt[i], dataset)
+
+                # 构造输入
                 src_str = ""
-                for idx in src_ids:
-                    if idx.item() == dataset.vocab["<pad>"]:
+                for idx in src[i]:
+                    if idx.item() == dataset.vocab["<pad>"] and arch == "encoder-decoder":
                         break
                     src_str += dataset.id2token[idx.item()]
+
+                # 类别统计
+                if "+" in src_str and "=" in src_str:
+                    a, b = src_str.split("+")
+                    b = b.replace("=", "")
+                    key = f"{len(a)}+{len(b)}"
+                else:
+                    key = "unknown"
                 
-                # 预测
-                pred = greedy_decode(model, dataset, src_str, device=device)
-                
-                # 真实标签
-                true = decode_tgt(tgt[i], dataset)
-                
+                # decoderonly 模型需要补齐
+                if arch == "decoder-only":
+                    for _ in range(len(src_str), dataset.max_len):
+                        src_str += "<pad>"
+
+                # 推理
+                pred = generate(model, dataset, src_str, device=device)
+
+                stats[key]["total"] += 1
                 if pred == true:
                     correct += 1
+                    stats[key]["correct"] += 1
                 total += 1
+
     accuracy = correct / total if total > 0 else 0
-    return accuracy
+
+    detailed_stats = {}
+    for key, v in stats.items():
+        total_k = v["total"]
+        correct_k = v["correct"]
+        acc_k = correct_k / total_k if total_k > 0 else 0
+        detailed_stats[key] = {
+            "samples": total_k,
+            "correct": correct_k,
+            "accuracy": acc_k
+        }
+
+    return accuracy, detailed_stats
+
 
 
 if __name__  == "__main__":
@@ -122,17 +154,32 @@ if __name__  == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
-    model = AdditionModel(vocab_size=len(dataset.vocab)).to(device)
-    checkpoint = torch.load("checkpoints/model_final.pth", map_location=device)
+    #model = AdditionModel(vocab_size=len(dataset.vocab)).to(device)
+    model = AdditionModel_DecoderOnly(vocab_size=len(dataset.vocab)).to(device)
+    checkpoint = torch.load("checkpoints/model_decoder_only_final.pth", map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
+
+    max_len = dataset.max_len
     test_dataset = load_dataset("addition_test.json")
     # 创建 DataLoader
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=True)
     model.eval()
 
-    print(compute_accuracy(model, test_dataset, test_loader, device))
+    print(compute_accuracy(model, test_dataset,test_loader, device))
 
     while(1):
         in_src = input("input:")
-        print(greedy_decode(model, dataset ,src_str = in_src))
+        if(in_src == "exit"):
+            break
+        if(in_src == ""):
+            continue
+        if(in_src[-1] != '='):
+            in_src += '='
+        if(len(in_src) > max_len):
+            print(f"Input too long! Max length is {max_len}.")
+            continue
+        if isinstance(model, AdditionModel_DecoderOnly):
+            for _ in range(len(in_src), dataset.max_len):
+               in_src += "<pad>"
+        print(generate(model, dataset ,src_str = in_src))
